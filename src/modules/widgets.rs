@@ -123,7 +123,7 @@ impl TextField {
                 }
             }
             Key::Enter { .. } => return true,
-            Key::Up | Key::Down | Key::Tab | Key::Escape => {}
+            Key::Up | Key::Down | Key::Tab | Key::Escape | Key::Menu => {}
         }
         false
     }

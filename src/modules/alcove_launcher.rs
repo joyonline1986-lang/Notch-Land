@@ -35,7 +35,9 @@ pub const ID: ModuleId = "alcove-launcher";
 /// One row of a list.
 const ROW: f32 = 46.0;
 /// Rows that show at once.
-const VIS: usize = 6;
+const VIS: usize = 5;
+/// One line of the Ctrl+K menu.
+const MENU_ROW: f32 = 34.0;
 /// The line with the icon and the text field.
 const HEAD: f32 = 46.0;
 /// The line of mode chips.
@@ -45,6 +47,10 @@ const GAP: f32 = 8.0;
 const CARD_W: f32 = 150.0;
 const CARD_H: f32 = 104.0;
 const CARD_GAP: f32 = 10.0;
+/// The switcher's icon row: an icon, the space between, and the height of the page.
+const SW_ICON: f32 = 64.0;
+const SW_GAP: f32 = 18.0;
+const SW_H: f32 = 132.0;
 /// Matches kept for a search.
 const KEEP: usize = 30;
 /// Commands the Run box remembers.
@@ -205,10 +211,20 @@ pub struct AlcoveLauncher {
     restore_focus: bool,
     /// The switcher was opened with Alt held: letting go of Alt chooses.
     alt_open: bool,
+    /// Wheel / swipe travel not yet turned into a step of the switcher.
+    wacc: f32,
     hwnd: SendHwnd,
     search_url: String,
     files_on: bool,
     folders: Vec<String>,
+    /// The Ctrl+K menu of what can be done with the chosen row, and the line chosen in it.
+    menu: bool,
+    msel: usize,
+    t_menu: Instant,
+    /// "Open with", "Move to" or "Copy to" waits for the app or folder to be chosen.
+    pending: Option<(Act, Hit)>,
+    /// An app that waits for its second "Uninstall".
+    armed_path: Option<String>,
 }
 
 impl AlcoveLauncher {
@@ -238,10 +254,16 @@ impl AlcoveLauncher {
             prev_fg: 0,
             restore_focus: true,
             alt_open: false,
+            wacc: 0.0,
             hwnd: SendHwnd(0),
             search_url: "https://www.google.com/search?q=".to_string(),
             files_on: true,
             folders: Vec::new(),
+            menu: false,
+            msel: 0,
+            t_menu: now,
+            pending: None,
+            armed_path: None,
         }
     }
 
@@ -285,6 +307,14 @@ impl AlcoveLauncher {
 
     /// A launcher hotkey was pressed. `what` is which one; `showing` is whether this page is on screen already.
     fn launch(&mut self, what: &str, showing: bool, cx: &mut Cx) {
+        if what == "switch-end" {
+            // the fingers came off the touchpad: open the window the switcher stopped on
+            if showing && self.open && self.mode == Mode::Windows {
+                self.commit_window(cx.fx);
+                cx.fx.redraw = true;
+            }
+            return;
+        }
         let (mode, back) = match what {
             "clip" => (Mode::Clip, false),
             "ai" => (Mode::Ai, false),
@@ -344,6 +374,9 @@ impl AlcoveLauncher {
         self.wins = Vec::new();
         self.armed = None;
         self.notice = None;
+        self.menu = false;
+        self.pending = None;
+        self.armed_path = None;
         self.closed_at = Some(Instant::now());
     }
 
@@ -356,11 +389,15 @@ impl AlcoveLauncher {
         self.top = 0;
         self.armed = None;
         self.notice = None;
+        self.menu = false;
+        self.pending = None;
+        self.armed_path = None;
         match mode {
             Mode::Windows => {
                 self.wins = crate::switcher::list();
                 // the one in front is first; the choice starts on the one before it
                 self.wsel = if self.wins.len() > 1 { 1 } else { 0 };
+                self.wacc = 0.0;
             }
             Mode::Kill => self.wins = crate::switcher::list(),
             Mode::Run => self.run_hist = crate::launcher::bridge_run_history(),
@@ -410,6 +447,10 @@ impl AlcoveLauncher {
     }
 
     fn list_search(&mut self, q: &str) {
+        if let Some((act, _)) = &self.pending {
+            let act = *act;
+            return self.list_targets(act, q);
+        }
         if q.is_empty() {
             // nothing typed: the apps used most
             let mut order: Vec<usize> = (0..self.apps.len()).collect();
@@ -467,7 +508,7 @@ impl AlcoveLauncher {
             } else {
                 let (path, dir) = &self.files[k - na];
                 let kind = if *dir { K::Folder } else { K::File };
-                self.hits.push(Hit::new(kind, file_name(path).to_string(), path.clone(), path.clone()));
+                self.hits.push(Hit::new(kind, file_name(path).to_string(), (if *dir { "Folder" } else { "File" }).to_string(), path.clone()));
             }
         }
         let url = format!("{}{}", self.search_url, crate::launcher::bridge_enc(q));
@@ -539,6 +580,20 @@ impl AlcoveLauncher {
             Mode::Ai => return self.ask(fx, bus),
             Mode::Run => return self.run_command(fx),
             _ => {}
+        }
+        // choosing where an action goes: Enter finishes it
+        if let Some((act, subject)) = self.pending.clone() {
+            let Some(t) = self.hits.get(self.sel).cloned() else { return };
+            let code = match act {
+                Act::OpenWith => 0,
+                Act::MoveTo => 1,
+                _ => 2,
+            };
+            crate::launcher::bridge_target(code, subject.path.clone(), t.path.clone());
+            self.pending = None;
+            self.restore_focus = false;
+            fx.collapse = true;
+            return;
         }
         let Some(h) = self.hits.get(self.sel).cloned() else { return };
         let hwnd = self.hwnd.hwnd();
@@ -647,6 +702,133 @@ impl AlcoveLauncher {
         self.refresh();
     }
 
+    /// Search with nothing typed: only the bar shows.
+    fn idle(&self) -> bool {
+        self.mode == Mode::Search && self.input.is_empty() && self.pending.is_none()
+    }
+
+    fn can_menu(&self) -> bool {
+        !self.idle() && self.pending.is_none() && !matches!(self.mode, Mode::Windows | Mode::Ai) && !self.hits.is_empty()
+    }
+
+    /// Height of what is above the bar (0 = nothing).
+    fn list_h(&self) -> f32 {
+        match self.mode {
+            Mode::Ai => 0.0,
+            Mode::Windows if !self.wins.is_empty() => CARD_H + 6.0,
+            Mode::Windows => 90.0,
+            _ if self.idle() => 0.0,
+            _ if self.hits.is_empty() => 90.0,
+            _ => self.hits.len().min(VIS) as f32 * ROW + 4.0,
+        }
+    }
+
+    fn menu_h(&self) -> f32 {
+        self.hits.get(self.sel).map_or(0.0, |h| acts(h).len() as f32 * MENU_ROW + 12.0)
+    }
+
+    /// "Open with", "Move to", "Copy to": the apps or the folders to choose from.
+    fn list_targets(&mut self, act: Act, q: &str) {
+        let ql = q.to_ascii_lowercase();
+        let qb = &ql.as_bytes()[..ql.len().min(40)];
+        let apps = act == Act::OpenWith;
+        let total = if apps { self.apps.len() } else { self.files.len() };
+        let mut pos: Vec<usize> = Vec::new();
+        let mut best: Vec<(i32, usize)> = Vec::with_capacity(KEEP + 1);
+        for k in 0..total {
+            let (name, dir) = if apps { (self.apps[k].0.as_str(), true) } else { (file_name(&self.files[k].0), self.files[k].1) };
+            if !dir {
+                continue;
+            }
+            let s = if qb.is_empty() { Some(0) } else { crate::launcher::bridge_match(name, qb, true, &mut pos) };
+            let Some(s) = s else { continue };
+            let s = s - name.len().min(80) as i32;
+            if best.len() < KEEP || s > best[best.len() - 1].0 {
+                let at = best.partition_point(|b| b.0 >= s);
+                best.insert(at, (s, k));
+                best.truncate(KEEP);
+            }
+        }
+        for &(_, k) in &best {
+            if apps {
+                let (name, path) = &self.apps[k];
+                self.hits.push(Hit::new(K::App, name.clone(), app_detail(path), path.clone()));
+            } else {
+                let path = &self.files[k].0;
+                self.hits.push(Hit::new(K::Folder, file_name(path).to_string(), "Folder".to_string(), path.clone()));
+            }
+        }
+    }
+
+    /// The line chosen in the Ctrl+K menu is done.
+    fn do_menu(&mut self, fx: &mut Effects, bus: &Bus) {
+        let Some(h) = self.hits.get(self.sel).cloned() else {
+            self.menu = false;
+            return;
+        };
+        let Some((act, _)) = acts(&h).get(self.msel).copied() else {
+            self.menu = false;
+            return;
+        };
+        let hwnd = self.hwnd.hwnd();
+        // taking an app off the computer asks twice
+        if act == Act::Uninstall && self.armed_path.as_deref() != Some(h.path.as_str()) {
+            self.armed_path = Some(h.path.clone());
+            self.notify("Choose it again to uninstall", true);
+            return;
+        }
+        self.menu = false;
+        match act {
+            Act::Open | Act::OpenLink | Act::Search | Act::Run | Act::Paste | Act::CopyResult => self.run(false, fx, bus),
+            Act::CopyClip => self.run(true, fx, bus),
+            Act::Admin => {
+                crate::launcher::bridge_admin(&h.path);
+                *self.usage.entry(h.path.clone()).or_insert(0) += 1;
+                self.restore_focus = false;
+                fx.collapse = true;
+            }
+            Act::Reveal => {
+                sys::shell_reveal(&h.path);
+                self.restore_focus = false;
+                fx.collapse = true;
+            }
+            Act::CopyPath | Act::CopyCmd => {
+                clip::set_text(hwnd, &h.path);
+                self.notify("Copied", false);
+            }
+            Act::Quit | Act::ForceQuit => {
+                if h.kind == K::Prog {
+                    self.run(act == Act::ForceQuit, fx, bus);
+                } else {
+                    crate::launcher::bridge_quit(&h.path, act == Act::ForceQuit);
+                    fx.collapse = true;
+                }
+            }
+            Act::Restart => {
+                crate::launcher::bridge_restart(&h.path);
+                fx.collapse = true;
+            }
+            Act::Uninstall => {
+                crate::launcher::bridge_uninstall(&h.path, &h.name);
+                self.apps.retain(|a| a.1 != h.path);
+                self.restore_focus = false;
+                fx.collapse = true;
+            }
+            Act::OpenWith | Act::MoveTo | Act::CopyTo => {
+                self.pending = Some((act, h));
+                self.input.clear();
+                self.sel = 0;
+                self.top = 0;
+                self.t_list = Instant::now();
+                self.refresh();
+            }
+            Act::DeleteClip => {
+                crate::cliphist::remove(h.id);
+                self.refresh();
+            }
+        }
+    }
+
     // -- drawing ----------------------------------------------------------------------------------------------
 
     fn draw_empty(&mut self, ui: &mut Ui, list: Rect, since: f32) {
@@ -666,49 +848,57 @@ impl AlcoveLauncher {
         ui.p.alpha = a0;
     }
 
+    /// The matches, growing upwards from the bar: the best one sits right above it.
     fn draw_list(&mut self, ui: &mut Ui, list: Rect, since: f32) -> bool {
         let n = self.hits.len();
         let a0 = ui.p.alpha;
         let mut busy = false;
-        // the wheel moves the list a row at a time
-        let w = ui.wheel(list);
-        if w > 0.0 {
-            self.top = self.top.saturating_sub(1);
-        } else if w < 0.0 {
-            self.top = (self.top + 1).min(n.saturating_sub(VIS));
+        // the wheel moves the list a row at a time (up shows the matches further up)
+        if !self.menu {
+            let w = ui.wheel(list);
+            if w > 0.0 {
+                self.top = (self.top + 1).min(n.saturating_sub(VIS));
+            } else if w < 0.0 {
+                self.top = self.top.saturating_sub(1);
+            }
         }
         let off = ui.glide(gkey("alcl-off", 0), self.top as f32);
         let sel_y = ui.glide(gkey("alcl-sel", 0), self.sel as f32);
         let first = off.floor().max(0.0) as usize;
         let last = ((off + VIS as f32).ceil() as usize + 1).min(n);
+        let slot = |i: f32| list.bottom() - (i - off + 1.0) * ROW;
         ui.p.push_clip(list);
         // the choice: a soft light that glides from row to row
-        let pill = Rect::new(list.x, list.y + (sel_y - off) * ROW, list.w, ROW - 4.0);
-        ui.p.fill_rounded(pill, 14.0, Color::white(0.13));
+        let pill = Rect::new(list.x, slot(sel_y), list.w, ROW - 4.0);
+        ui.p.fill_rounded(pill, 16.0, Color::white(0.10));
         let mut clicked = None;
         for i in first..last {
             let rk = ease_out(((since - (i.saturating_sub(self.top)).min(8) as f32 * 0.025) / 0.24).clamp(0.0, 1.0));
             if rk < 1.0 {
                 busy = true;
             }
-            let row = Rect::new(list.x, list.y + (i as f32 - off) * ROW + (1.0 - rk) * 10.0, list.w, ROW - 4.0);
+            let row = Rect::new(list.x, slot(i as f32) + (1.0 - rk) * 10.0, list.w, ROW - 4.0);
             ui.p.alpha = a0 * rk;
             let h = &self.hits[i];
-            let hover = ui.hovered(row);
+            let hover = !self.menu && ui.hovered(row);
             if hover {
                 ui.hot = true;
                 if i != self.sel {
-                    ui.p.fill_rounded(row, 14.0, Color::white(0.06));
+                    ui.p.fill_rounded(row, 16.0, Color::white(0.05));
                 }
             }
             // the picture
             let ib = Rect::new(row.x + 12.0, row.cy() - 15.0, 30.0, 30.0);
-            let shell = matches!(h.kind, K::App | K::File | K::Folder | K::Prog);
+            let badge = matches!(h.kind, K::File | K::Folder);
+            let shell = matches!(h.kind, K::App | K::Prog);
             let img = if shell { self.icons.get(&h.path, &h.name) } else { h.thumb.clone() };
             match img {
-                Some(img) => ui.p.image(&img, ib, 7.0, 1.0),
+                _ if badge => {
+                    crate::alcove::file_badge(ui, ib, &crate::alcove::badge_label(&h.path, h.kind == K::Folder))
+                }
+                Some(img) => ui.p.image(&img, ib, 8.0, 1.0),
                 None => {
-                    ui.p.fill_rounded(ib, 9.0, Color::white(0.10));
+                    ui.p.fill_rounded(ib, 9.0, Color::white(0.08));
                     ui.p.icon(kind_icon(h), ib.inset(6.5), Color::white(0.9));
                 }
             }
@@ -717,24 +907,24 @@ impl AlcoveLauncher {
             let tw = (row.right() - tx - 104.0).max(40.0);
             let big = h.kind == K::Calc;
             ui.p.push_clip(Rect::new(tx, row.y, tw, row.h));
-            let name_st = if big { TextStyle::new(18.0, palette::TEXT).semibold() } else { TextStyle::new(14.0, palette::TEXT).medium() };
+            let name_st = if big { TextStyle::new(18.0, palette::TEXT).semibold() } else { TextStyle::new(13.5, palette::TEXT).medium() };
             ui.p.text(&h.name, Rect::new(tx, row.y + 3.0, tw + 100.0, 22.0), &name_st);
             let (detail, dc) = if h.kind == K::System && self.armed == Some(h.idx) {
                 ("Press Enter again to confirm".to_string(), palette::ORANGE)
             } else {
                 (h.detail.clone(), palette::TEXT_FAINT)
             };
-            ui.p.text(&detail, Rect::new(tx, row.y + 23.0, tw + 100.0, 16.0), &TextStyle::new(11.5, dc));
+            ui.p.text(&detail, Rect::new(tx, row.y + 23.0, tw + 100.0, 16.0), &TextStyle::new(11.0, dc));
             ui.p.pop_clip();
             // what Enter does
             let side = if i == self.sel { action_word(h) } else { kind_word(h) };
-            let a = if i == self.sel { 0.75 } else { 0.38 };
+            let a = if i == self.sel { 0.75 } else { 0.34 };
             ui.p.text(
                 side,
                 Rect::new(row.right() - 100.0, row.y, 88.0, row.h),
                 &TextStyle::new(11.5, Color::white(a)).medium().right(),
             );
-            if ui.clicked(row) {
+            if !self.menu && ui.clicked(row) {
                 clicked = Some(i);
             }
         }
@@ -745,7 +935,7 @@ impl AlcoveLauncher {
             let track = Rect::new(list.right() - 3.0, list.y + 2.0, 3.0, list.h - 4.0);
             let frac = VIS as f32 / n as f32;
             let th = (track.h * frac).max(14.0);
-            let ty = track.y + (track.h - th) * (off / (n - VIS) as f32).clamp(0.0, 1.0);
+            let ty = track.bottom() - th - (track.h - th) * (off / (n - VIS) as f32).clamp(0.0, 1.0);
             ui.p.fill_rounded(Rect::new(track.x, ty, track.w, th), 1.5, Color::white(0.22));
         }
         if let Some(i) = clicked {
@@ -754,6 +944,50 @@ impl AlcoveLauncher {
             self.run(false, ui.fx, ui.bus);
         }
         busy
+    }
+
+    /// The Ctrl+K menu: a small black card above the bar, at the right.
+    fn draw_menu(&mut self, ui: &mut Ui, r: Rect, bar: Rect) -> bool {
+        let Some(h) = self.hits.get(self.sel).cloned() else {
+            self.menu = false;
+            return false;
+        };
+        let list = acts(&h);
+        let t = ease_out((ui.now.saturating_duration_since(self.t_menu).as_secs_f32() / 0.18).clamp(0.0, 1.0));
+        let w = 244.0f32.min(r.w);
+        let ch = list.len() as f32 * MENU_ROW + 12.0;
+        let card = Rect::new(r.right() - w, bar.y - GAP - ch + (1.0 - t) * 8.0, w, ch);
+        let a0 = ui.p.alpha;
+        ui.p.alpha = a0 * t;
+        ui.p.fill_rounded(card, 18.0, Color::rgba(0.045, 0.045, 0.05, 1.0));
+        ui.p.stroke_rounded(card.inset(0.5), 17.5, 1.0, Color::white(0.12));
+        let sel_y = ui.glide(gkey("alcl-msel", 0), self.msel as f32);
+        ui.p.fill_rounded(
+            Rect::new(card.x + 6.0, card.y + 6.0 + sel_y * MENU_ROW, card.w - 12.0, MENU_ROW - 2.0),
+            12.0,
+            Color::white(0.10),
+        );
+        let mut pick = None;
+        for (i, (act, label)) in list.iter().enumerate() {
+            let row = Rect::new(card.x + 6.0, card.y + 6.0 + i as f32 * MENU_ROW, card.w - 12.0, MENU_ROW - 2.0);
+            if ui.hovered(row) {
+                ui.hot = true;
+                self.msel = i;
+            }
+            ui.p.icon(act.icon(), Rect::new(row.x + 12.0, row.cy() - 8.0, 16.0, 16.0), Color::white(0.78));
+            ui.p.text(label, Rect::new(row.x + 38.0, row.y, row.w - 46.0, row.h), &TextStyle::new(13.0, palette::TEXT).medium());
+            if ui.clicked(row) {
+                pick = Some(i);
+            }
+        }
+        ui.p.alpha = a0;
+        if let Some(i) = pick {
+            self.msel = i;
+            self.do_menu(ui.fx, ui.bus);
+        } else if !ui.hovered(card) && ui.clicked(r) {
+            self.menu = false;
+        }
+        t < 1.0
     }
 
     fn draw_windows(&mut self, ui: &mut Ui, list: Rect, since: f32) -> bool {
@@ -824,6 +1058,96 @@ impl AlcoveLauncher {
             self.commit_window(ui.fx);
         }
         busy
+    }
+
+    /// The switcher: a row of the open windows' icons. The choice is a lit square that glides along; the
+    /// window's name is under it. Tab, the arrows, the wheel or a sideways swipe move it, a click or Enter opens.
+    fn draw_switcher(&mut self, ui: &mut Ui, r: Rect) {
+        let n = self.wins.len();
+        let a0 = ui.p.alpha;
+        let since = ui.now.saturating_duration_since(self.t_list).as_secs_f32();
+        let mut busy = since < 0.5;
+        // the wheel and sideways swipes (up and left: before)
+        if ui.hovered(r) {
+            self.wacc += ui.input.hwheel - ui.wheel(r);
+            while self.wacc >= 1.0 {
+                self.step(1);
+                self.wacc -= 1.0;
+            }
+            while self.wacc <= -1.0 {
+                self.step(-1);
+                self.wacc += 1.0;
+            }
+        }
+        let pitch = SW_ICON + SW_GAP;
+        let total = n as f32 * pitch - SW_GAP;
+        let target = if total <= r.w {
+            -(r.w - total) * 0.5
+        } else {
+            (self.wsel as f32 * pitch - (r.w - SW_ICON) * 0.5).clamp(0.0, total - r.w)
+        };
+        let off = ui.glide(gkey("alcl-woff", 0), target);
+        let sel_x = ui.glide(gkey("alcl-wsel", 0), self.wsel as f32);
+        let top = r.y + 12.0;
+        ui.p.push_clip(r);
+        let lit = Rect::new(r.x - off + sel_x * pitch - 7.0, top - 7.0, SW_ICON + 14.0, SW_ICON + 14.0);
+        ui.p.fill_rounded(lit, 20.0, Color::white(0.15));
+        ui.p.stroke_rounded(lit.inset(0.5), 19.5, 1.0, Color::white(0.36));
+        let mut clicked = None;
+        for i in 0..n {
+            let x = r.x - off + i as f32 * pitch;
+            if x + SW_ICON < r.x - 8.0 || x > r.right() + 8.0 {
+                continue;
+            }
+            let rk = ease_out(((since - i.min(8) as f32 * 0.03) / 0.26).clamp(0.0, 1.0));
+            if rk < 1.0 {
+                busy = true;
+            }
+            let slot = Rect::new(x, top, SW_ICON, SW_ICON);
+            if ui.hovered(slot) {
+                ui.hot = true;
+                if i != self.wsel {
+                    ui.p.fill_rounded(slot.inset(-6.0), 18.0, Color::white(0.07));
+                }
+            }
+            ui.p.alpha = a0 * rk;
+            let ib = slot.center_square(SW_ICON * (0.8 + 0.2 * rk));
+            let w = &self.wins[i];
+            let app = w.app();
+            match self.icons.get(&w.exe, &app) {
+                Some(img) => ui.p.image(&img, ib, 14.0, if w.minimized { 0.55 } else { 1.0 }),
+                None => {
+                    ui.p.fill_rounded(ib, 14.0, Color::white(0.10));
+                    ui.p.icon(Icon::Image, ib.inset(16.0), Color::white(0.9));
+                }
+            }
+            ui.p.alpha = a0;
+            if ui.clicked(slot) {
+                clicked = Some(i);
+            }
+        }
+        // the name of the choice
+        if let Some(w) = self.wins.get(self.wsel) {
+            let app = w.app();
+            let mut line = app.clone();
+            if w.minimized {
+                line.push_str("  \u{b7}  Minimized");
+            }
+            let y = top + SW_ICON + 16.0;
+            ui.p.text(&line, Rect::new(r.x + 12.0, y, r.w - 24.0, 18.0), &TextStyle::new(13.5, palette::TEXT).medium().center());
+            let t = w.title.trim();
+            if !t.is_empty() && t != app {
+                ui.p.text(t, Rect::new(r.x + 12.0, y + 19.0, r.w - 24.0, 15.0), &TextStyle::new(11.5, palette::TEXT_FAINT).center());
+            }
+        }
+        ui.p.pop_clip();
+        if let Some(i) = clicked {
+            self.wsel = i;
+            self.commit_window(ui.fx);
+        }
+        if busy || self.icons.starved {
+            ui.animate();
+        }
     }
 }
 
@@ -910,18 +1234,45 @@ impl Module for AlcoveLauncher {
     }
 
     fn page_height(&self, _width: f32) -> f32 {
-        let top = HEAD + 2.0 + CHIPS + GAP;
-        let body = match self.mode {
-            Mode::Windows if !self.wins.is_empty() => CARD_H + 6.0,
-            Mode::Windows | Mode::Ai => 96.0,
-            _ if self.hits.is_empty() => 96.0,
-            _ => self.hits.len().min(VIS) as f32 * ROW + 4.0,
-        };
-        top + body
+        if self.mode == Mode::Windows && !self.wins.is_empty() && self.pending.is_none() {
+            return SW_H;
+        }
+        let lh = self.list_h();
+        let mut h = if lh > 0.0 { lh + GAP + HEAD } else { HEAD };
+        if self.menu {
+            h = h.max(self.menu_h() + GAP + HEAD);
+        }
+        h
     }
 
     fn on_key(&mut self, key: Key, cx: &mut Cx) {
         cx.fx.redraw = true;
+        if key == Key::Menu {
+            self.menu = !self.menu && self.can_menu();
+            self.msel = 0;
+            self.t_menu = Instant::now();
+            return;
+        }
+        if self.menu {
+            let n = self.hits.get(self.sel).map_or(0, |h| acts(h).len());
+            match key {
+                Key::Up => {
+                    self.msel = self.msel.saturating_sub(1);
+                    return;
+                }
+                Key::Down => {
+                    self.msel = (self.msel + 1).min(n.saturating_sub(1));
+                    return;
+                }
+                Key::Enter { .. } => {
+                    self.do_menu(cx.fx, cx.bus);
+                    return;
+                }
+                Key::Tab | Key::Left | Key::Right => return,
+                // typing goes on: the menu just closes
+                _ => self.menu = false,
+            }
+        }
         if self.mode == Mode::Windows {
             match key {
                 Key::Tab | Key::Right | Key::Down => self.step(1),
@@ -934,14 +1285,22 @@ impl Module for AlcoveLauncher {
             return;
         }
         match key {
-            Key::Up => self.move_sel(-1),
-            Key::Down => self.move_sel(1),
+            // the list grows upwards from the bar: Up goes on to the next match, Down comes back to the bar
+            Key::Up => self.move_sel(1),
+            Key::Down => self.move_sel(-1),
             Key::Tab => {
                 let next = self.mode.next();
                 self.set_mode(next, cx.bus);
             }
+            // nothing typed: nothing is listed, so Enter has nothing to open
+            Key::Enter { .. } if self.idle() => {}
             Key::Enter { shift } => self.run(shift, cx.fx, cx.bus),
             // nothing left to delete in another mode: back to searching
+            // choosing an app or folder: Backspace on nothing goes back
+            Key::Backspace if self.input.is_empty() && self.pending.is_some() => {
+                self.pending = None;
+                self.refresh();
+            }
             Key::Backspace if self.input.is_empty() && self.mode != Mode::Search => self.set_mode(Mode::Search, cx.bus),
             k => {
                 let before = self.input.text();
@@ -956,65 +1315,96 @@ impl Module for AlcoveLauncher {
     fn draw_page(&mut self, ui: &mut Ui, r: Rect) {
         self.icons.budget = 3;
         self.icons.starved = false;
+        if self.mode == Mode::Windows && !self.wins.is_empty() && self.pending.is_none() {
+            return self.draw_switcher(ui, r);
+        }
         let a0 = ui.p.alpha;
         let since = ui.now.saturating_duration_since(self.t_list).as_secs_f32();
         let mode_t = ui.now.saturating_duration_since(self.t_mode).as_secs_f32();
         let mut busy = since < 0.6 || mode_t < 0.35;
 
-        // the icon of the mode pops in, then the field
-        let head = Rect::new(r.x, r.y, r.w, HEAD);
-        let grow = smoothstep(0.0, 0.4, since);
-        let ease = 1.0 - (1.0 - grow) * (1.0 - grow) * (1.0 - grow);
-        let pw = r.w * (0.7 + 0.3 * ease);
-        let pill = Rect::new(r.cx() - pw * 0.5, head.y + 3.0, pw, HEAD - 6.0);
-        ui.p.fill_rounded(pill, pill.h * 0.5, crate::util::Color::black(1.0));
-        ui.p.stroke_rounded(pill.inset(0.5), pill.h * 0.5 - 0.5, 1.0, crate::util::Color::white(0.10));
+        // the search bar sits at the bottom: a black pill that grows out from the middle
+        let bar = Rect::new(r.x, r.bottom() - HEAD, r.w, HEAD);
+        let grow = ease_out((since / 0.4).clamp(0.0, 1.0));
+        let pw = r.w * (0.78 + 0.22 * grow);
+        let pill = Rect::new(r.cx() - pw * 0.5, bar.y + 3.0, pw, HEAD - 6.0);
+        ui.p.fill_rounded(pill, pill.h * 0.5, Color::black(1.0));
+        ui.p.stroke_rounded(pill.inset(0.5), pill.h * 0.5 - 0.5, 1.0, Color::white(0.11));
         let pop = smoothstep(0.0, 0.3, mode_t);
         ui.p.alpha = a0 * pop;
-        let ico = Rect::new(pill.x + 14.0, pill.cy() - 9.0, 18.0, 18.0);
-        ui.p.icon(self.mode.icon(), ico.center_square(18.0 * (0.7 + 0.3 * pop)), palette::TEXT);
-        ui.p.alpha = a0;
-        let field = Rect::new(pill.x + 42.0, head.y, (pill.w - 56.0).max(40.0), head.h);
-        let hint = if self.mode == Mode::Search { "Search app..." } else { self.mode.hint() };
-        self.input.draw_bare(ui, field, hint, true, 18.0);
-
-        // the modes
-        let cy = head.bottom() + 2.0;
-        let x = r.x;
-        // a short message beside the chips (copied, can't find ...)
-        let mut expired = false;
-        if let Some((msg, at, bad)) = &self.notice {
-            if at.elapsed() < Duration::from_millis(2500) {
-                let c = if *bad { palette::RED } else { palette::TEXT_DIM };
-                if x + 80.0 < r.right() {
-                    ui.p.text(msg, Rect::new(x + 6.0, cy, r.right() - x - 6.0, CHIPS), &TextStyle::new(12.0, c).medium().right());
-                }
-                ui.animate_slow();
-            } else {
-                expired = true;
-            }
+        let (ix, iy) = (pill.x + 24.0, pill.cy());
+        if self.mode == Mode::Search {
+            // a magnifier
+            let col = Color::white(0.7);
+            let sc = 0.8 + 0.2 * pop;
+            ui.p.stroke_circle(ix - 1.5, iy - 1.5, 6.0 * sc, 1.8, col);
+            ui.p.line(ix + 2.8 * sc, iy + 2.8 * sc, ix + 7.6 * sc, iy + 7.6 * sc, 1.9, col);
+        } else {
+            let ib = Rect::new(ix - 9.0, iy - 9.0, 18.0, 18.0);
+            ui.p.icon(self.mode.icon(), ib.center_square(18.0 * (0.7 + 0.3 * pop)), palette::TEXT);
         }
-        if expired {
+        ui.p.alpha = a0;
+
+        // the right end of the bar: a short message (copied, can't find ...) or the way to the menu
+        if self.notice.as_ref().is_some_and(|n| n.1.elapsed() >= Duration::from_millis(2500)) {
             self.notice = None;
         }
-
-        // the list, the cards or an empty message
-        let top = cy + CHIPS + GAP;
-        let list = Rect::new(r.x, top, r.w, (r.bottom() - top).max(0.0));
-        let since = ui.now.saturating_duration_since(self.t_list).as_secs_f32();
-        let shown = match self.mode {
-            Mode::Windows if !self.wins.is_empty() => self.draw_windows(ui, list, since),
-            Mode::Ai | Mode::Windows => {
-                self.draw_empty(ui, list, since);
-                false
+        let side_w = 120.0;
+        let hr = Rect::new(pill.right() - side_w - 14.0, pill.y, side_w, pill.h);
+        let mut field_w = pill.w - 42.0 - 16.0;
+        let notice = self.notice.clone();
+        if let Some((msg, _, bad)) = notice {
+            let c = if bad { palette::RED } else { palette::TEXT_DIM };
+            ui.p.text(&msg, hr, &TextStyle::new(12.0, c).medium().right());
+            ui.animate_slow();
+            field_w = pill.w - 42.0 - side_w - 24.0;
+        } else if self.can_menu() {
+            let hv = ui.hovered(hr);
+            if hv {
+                ui.hot = true;
             }
-            _ if self.hits.is_empty() => {
-                self.draw_empty(ui, list, since);
-                false
+            let a = if hv { 0.8 } else { 0.42 };
+            ui.p.text("Ctrl K  Actions", hr, &TextStyle::new(11.5, Color::white(a)).medium().right());
+            if ui.clicked(hr) {
+                self.menu = !self.menu;
+                self.msel = 0;
+                self.t_menu = Instant::now();
             }
-            _ => self.draw_list(ui, list, since),
+            field_w = pill.w - 42.0 - side_w - 24.0;
+        }
+        let field = Rect::new(pill.x + 42.0, bar.y, field_w.max(40.0), bar.h);
+        let hint = match &self.pending {
+            Some((Act::OpenWith, _)) => "Open with which app?",
+            Some((Act::MoveTo, _)) => "Move to which folder?",
+            Some(_) => "Copy to which folder?",
+            None if self.mode == Mode::Search => "Search app...",
+            None => self.mode.hint(),
         };
-        busy |= shown || self.icons.starved;
+        self.input.draw_bare(ui, field, hint, true, 18.0);
+
+        // the list or the cards above the bar (nothing at all while nothing is typed)
+        let lh = self.list_h();
+        if lh > 0.0 {
+            let list = Rect::new(r.x, bar.y - GAP - lh, r.w, lh);
+            let since = ui.now.saturating_duration_since(self.t_list).as_secs_f32();
+            let shown = match self.mode {
+                Mode::Windows if !self.wins.is_empty() => self.draw_windows(ui, list, since),
+                Mode::Ai | Mode::Windows => {
+                    self.draw_empty(ui, list, since);
+                    false
+                }
+                _ if self.hits.is_empty() => {
+                    self.draw_empty(ui, list, since);
+                    false
+                }
+                _ => self.draw_list(ui, list, since),
+            };
+            busy |= shown;
+        }
+        if self.menu {
+            busy |= self.draw_menu(ui, r, bar);
+        }
+        busy |= self.icons.starved;
         if busy {
             ui.animate();
         }
@@ -1024,6 +1414,89 @@ impl Module for AlcoveLauncher {
 fn alt_down() -> bool {
     let state = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) };
     state as u16 & 0x8000 != 0
+}
+
+/// What the Ctrl+K menu can do with a row (the same things as Tuna's launcher).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Act {
+    Open,
+    Admin,
+    Reveal,
+    CopyPath,
+    CopyResult,
+    OpenLink,
+    Search,
+    Quit,
+    Restart,
+    ForceQuit,
+    Paste,
+    CopyClip,
+    DeleteClip,
+    OpenWith,
+    MoveTo,
+    CopyTo,
+    Run,
+    Uninstall,
+    CopyCmd,
+}
+
+impl Act {
+    fn label(self) -> &'static str {
+        match self {
+            Act::Open => "Open",
+            Act::Admin => "Run as administrator",
+            Act::Reveal => "Show in folder",
+            Act::CopyPath => "Copy path",
+            Act::CopyResult => "Copy result",
+            Act::OpenLink => "Open link",
+            Act::Search => "Search the web",
+            Act::Quit => "Quit",
+            Act::Restart => "Restart",
+            Act::ForceQuit => "Force quit",
+            Act::Paste => "Paste",
+            Act::CopyClip => "Copy",
+            Act::DeleteClip => "Remove from history",
+            Act::OpenWith => "Open with\u{2026}",
+            Act::MoveTo => "Move to\u{2026}",
+            Act::CopyTo => "Copy to\u{2026}",
+            Act::Run => "Run",
+            Act::Uninstall => "Uninstall",
+            Act::CopyCmd => "Copy command",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Act::Open => Icon::Send,
+            Act::Admin | Act::Run => Icon::Bolt,
+            Act::Reveal | Act::MoveTo => Icon::Folder,
+            Act::CopyPath | Act::CopyResult | Act::CopyClip | Act::CopyTo | Act::CopyCmd => Icon::Copy,
+            Act::OpenLink => Icon::Link,
+            Act::Search => Icon::Globe,
+            Act::Quit => Icon::Close,
+            Act::Restart => Icon::Refresh,
+            Act::ForceQuit => Icon::Stop,
+            Act::Paste => Icon::Clipboard,
+            Act::DeleteClip | Act::Uninstall => Icon::Trash,
+            Act::OpenWith => Icon::Grid,
+        }
+    }
+}
+
+fn acts(h: &Hit) -> Vec<(Act, &'static str)> {
+    let list: &[Act] = match h.kind {
+        K::App if h.path.starts_with("shell:") => &[Act::Open, Act::Uninstall],
+        K::App => &[Act::Open, Act::Admin, Act::Reveal, Act::Quit, Act::Restart, Act::ForceQuit, Act::Uninstall],
+        K::File | K::Folder => &[Act::Open, Act::Reveal, Act::CopyPath, Act::OpenWith, Act::MoveTo, Act::CopyTo],
+        K::Calc => &[Act::CopyResult],
+        K::Url => &[Act::OpenLink, Act::CopyPath],
+        K::Web => &[Act::Search],
+        K::Clip => &[Act::Paste, Act::CopyClip, Act::DeleteClip],
+        K::System => &[Act::Run],
+        K::Prog => &[Act::Quit, Act::ForceQuit],
+        K::Cmd => &[Act::Run, Act::CopyCmd],
+    };
+    list.iter().map(|a| (*a, a.label())).collect()
 }
 
 fn file_name(p: &str) -> &str {

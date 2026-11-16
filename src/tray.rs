@@ -27,6 +27,7 @@ pub const CMD_AUTOSTART: u32 = 300;
 pub const CMD_BLUR: u32 = 301;
 pub const CMD_HOVER: u32 = 302;
 pub const CMD_FULLSCREEN: u32 = 303;
+pub const CMD_SETTINGS: u32 = 403;
 pub const CMD_EDIT_CONFIG: u32 = 400;
 pub const CMD_OPEN_FOLDER: u32 = 401;
 pub const CMD_RELOAD: u32 = 402;
@@ -158,6 +159,7 @@ fn build(s: &MenuState) -> HMENU {
         append(menu, CMD_FULLSCREEN, "Hide in fullscreen apps", s.hide_fullscreen);
         append(menu, CMD_AUTOSTART, "Start with Windows", s.autostart);
         separator(menu);
+        append(menu, CMD_SETTINGS, "Settings\u{2026}", false);
         append(menu, CMD_EDIT_CONFIG, "Edit settings…", false);
         append(menu, CMD_OPEN_FOLDER, "Open settings folder", false);
         append(menu, CMD_RELOAD, "Reload settings", false);

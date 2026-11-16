@@ -746,3 +746,32 @@ pub fn hello_stage(name: &str) -> (f32, f32) {
         ((180.0 + name.chars().count() as f32 * 13.0).clamp(310.0, 470.0), 150.0)
     }
 }
+
+/// The word on a file's badge: its extension (PNG, MP4, HTML...), FILE when there is none or it is long.
+pub fn badge_label(path: &str, dir: bool) -> String {
+    if dir {
+        return "FOLDER".to_string();
+    }
+    let name = path.trim_end_matches(['\\', '/']).rsplit(['\\', '/']).next().unwrap_or("");
+    match name.rsplit_once('.') {
+        Some((stem, ext))
+            if !stem.is_empty() && (1..=4).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            ext.to_ascii_uppercase()
+        }
+        _ => "FILE".to_string(),
+    }
+}
+
+/// A file or folder that is not an app: a black box with a word in it.
+pub fn file_badge(ui: &mut Ui, r: Rect, label: &str) {
+    let rad = r.w.min(r.h) * 0.27;
+    ui.p.fill_rounded(r, rad, Color::black(1.0));
+    ui.p.stroke_rounded(r.inset(0.5), rad - 0.5, 1.0, Color::white(0.2));
+    let k = match label.chars().count() {
+        0..=3 => 0.36,
+        4 => 0.3,
+        _ => 0.235,
+    };
+    ui.p.text(label, r, &TextStyle::new(r.w.min(r.h) * k, Color::white(0.94)).semibold().center());
+}

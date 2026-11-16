@@ -413,7 +413,7 @@ impl Module for Ai {
                     clip::set_text(self.hwnd.hwnd(), &t.assistant.clone());
                 }
             }
-            Key::Tab | Key::Escape => {}
+            Key::Tab | Key::Escape | Key::Menu => {}
         }
         cx.fx.layout_changed = true;
     }

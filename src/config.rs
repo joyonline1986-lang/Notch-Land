@@ -201,6 +201,9 @@ pub struct Hotkeys {
     /// The window switcher (replaces Alt+Tab): a row of the open windows with a picture of each; Tab or the
     /// arrow keys choose, Enter or letting go of Alt opens. Shift added to these keys goes backwards.
     pub launcher_switch: String,
+    /// Swipe three fingers sideways on a precision touchpad to open the window switcher and move through it;
+    /// lifting the fingers opens the chosen window. Turn off Windows' own three-finger gestures first. Needs a restart.
+    pub switch_swipe: bool,
     /// Maximise the window in front (press again to put it back). Caught by a low-level hook, so Win+F works
     /// even though Windows wants it.
     pub window_max: String,
@@ -225,6 +228,7 @@ impl Default for Hotkeys {
             launcher_ai: "Win+G".into(),
             launcher_run: "Win+R".into(),
             launcher_switch: "Alt+Tab".into(),
+            switch_swipe: true,
             window_max: "Win+F".into(),
             window_close: "Win+Q".into(),
             radial: "Win+M".into(),
@@ -1194,6 +1198,10 @@ launcher_run = "Win+R"
 # The window switcher in place of Alt+Tab: a row of your open windows, each with a picture. Tab or the arrow keys
 # choose, Enter (or letting go of Alt after Tab) opens it. Leave empty to keep the Windows Alt+Tab.
 launcher_switch = "Alt+Tab"
+# Swipe three fingers sideways on a precision touchpad to open that switcher and move through it; lifting the
+# fingers opens the chosen window. Windows' own three-finger gestures must be off for this (Settings >
+# Bluetooth & devices > Touchpad > Three-finger gestures > Nothing). Needs a restart of Notch-Land.
+switch_swipe = true
 # Maximise the window in front (press again to put it back). Leave empty to turn it off.
 window_max = "Win+F"
 # Close the window in front. Leave empty to turn it off.
@@ -1499,6 +1507,7 @@ mod tests {
         assert_eq!(c.hotkeys.launcher_ai, d.hotkeys.launcher_ai);
         assert_eq!(c.hotkeys.launcher_run, d.hotkeys.launcher_run);
         assert_eq!(c.hotkeys.launcher_switch, d.hotkeys.launcher_switch);
+        assert_eq!(c.hotkeys.switch_swipe, d.hotkeys.switch_swipe);
         assert_eq!(c.hotkeys.window_max, d.hotkeys.window_max);
         assert_eq!(c.hotkeys.window_close, d.hotkeys.window_close);
         assert_eq!(c.hotkeys.radial, d.hotkeys.radial);

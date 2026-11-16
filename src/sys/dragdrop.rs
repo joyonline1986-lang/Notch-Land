@@ -33,7 +33,9 @@ static DRAGGING_OUT: AtomicBool = AtomicBool::new(false);
 
 pub enum DropEvent {
     /// Files entered the notch. The handler returns whether they are accepted.
-    Enter,
+    Enter(Vec<String>),
+    /// The pointer moved while files are over the notch (screen pixels).
+    Over(i32, i32),
     Leave,
     Drop(Vec<String>),
 }
@@ -74,13 +76,16 @@ impl IDropTarget_Impl for Target_Impl {
         effect: *mut DROPEFFECT,
     ) -> Result<()> {
         let has_files = data.as_ref().is_some_and(|d| unsafe { d.QueryGetData(&file_format()) } == S_OK);
-        let ok = has_files && !DRAGGING_OUT.load(Ordering::Relaxed) && (self.handler)(DropEvent::Enter);
+        let ok = has_files && !DRAGGING_OUT.load(Ordering::Relaxed) && (self.handler)(DropEvent::Enter(data.as_ref().map(|d| unsafe { dropped_files(d) }).unwrap_or_default()));
         self.accepting.set(ok);
         unsafe { *effect = if ok { pick(*effect) } else { DROPEFFECT_NONE } };
         Ok(())
     }
 
-    fn DragOver(&self, _keys: MODIFIERKEYS_FLAGS, _pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
+    fn DragOver(&self, _keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
+        if self.accepting.get() {
+            (self.handler)(DropEvent::Over(pt.x, pt.y));
+        }
         unsafe { *effect = if self.accepting.get() { pick(*effect) } else { DROPEFFECT_NONE } };
         Ok(())
     }
@@ -96,7 +101,7 @@ impl IDropTarget_Impl for Target_Impl {
         &self,
         data: Ref<IDataObject>,
         _keys: MODIFIERKEYS_FLAGS,
-        _pt: &POINTL,
+        pt: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> Result<()> {
         if !self.accepting.replace(false) {
@@ -105,6 +110,7 @@ impl IDropTarget_Impl for Target_Impl {
         }
         let files = data.as_ref().map(|d| unsafe { dropped_files(d) }).unwrap_or_default();
         unsafe { *effect = if files.is_empty() { DROPEFFECT_NONE } else { pick(*effect) } };
+        (self.handler)(DropEvent::Over(pt.x, pt.y));
         (self.handler)(DropEvent::Drop(files));
         Ok(())
     }

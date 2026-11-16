@@ -186,6 +186,7 @@ impl Osd {
     fn sync_keys(&mut self, cx: &Cx, peeks_shown: bool) {
         let c = &cx.cfg.osd;
         STEP.store(c.volume_step, Ordering::Relaxed);
+        flyout::enable(c.brightness && c.replace_system_flyout);
         let want = self.tx.is_some() && c.volume && c.replace_system_flyout && peeks_shown;
         match (want, self.keys) {
             (true, None) => {
@@ -758,6 +759,7 @@ fn brightness_worker(bus: Bus) {
                 events.Next(WBEM_INFINITE, &mut objs, &mut n).ok()?;
                 if let Some(b) = objs[0].take().and_then(|o| read_int(&o, w!("Brightness"))) {
                     bus.to_module(ID, OsdMsg::Brightness(b.min(100) as u8));
+                    flyout::suppress();
                 }
             }
         }
@@ -779,6 +781,128 @@ unsafe fn read_int(obj: &IWbemClassObject, name: PCWSTR) -> Option<u32> {
     };
     let _ = VariantClear(&mut v);
     out
+}
+
+/// The Windows brightness flyout, kept off the screen. It appears a moment after the brightness changes, so
+/// only for about a second after each change (never otherwise, so no idle cost) any small topmost window of
+/// the shell is hidden and moved out of sight.
+mod flyout {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use windows::core::{BOOL, PWSTR};
+    use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
+    use windows::Win32::System::Threading::{
+        GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SetWindowPos,
+        ShowWindow, GWL_EXSTYLE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, WS_EX_TOPMOST,
+    };
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static DIAG_DONE: AtomicBool = AtomicBool::new(false);
+
+    pub fn enable(on: bool) {
+        ON.store(on, Ordering::Relaxed);
+    }
+
+    struct Ctx {
+        seen: Vec<isize>,
+        hidden: u32,
+        diag: bool,
+    }
+
+    fn exe_name(pid: u32) -> String {
+        if pid <= 4 {
+            return String::new();
+        }
+        unsafe {
+            let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return String::new() };
+            let mut buf = [0u16; 520];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+            let _ = CloseHandle(h);
+            if !ok {
+                return String::new();
+            }
+            let full = String::from_utf16_lossy(&buf[..len as usize]);
+            full.rsplit(['\\', '/']).next().unwrap_or("").to_lowercase()
+        }
+    }
+
+    unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> BOOL {
+        let ctx = &mut *(lp.0 as *mut Ctx);
+        if !IsWindowVisible(h).as_bool() {
+            return true.into();
+        }
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
+        if ex & WS_EX_TOPMOST.0 == 0 {
+            return true.into();
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(h, &mut r).is_err() {
+            return true.into();
+        }
+        let (w, ht) = (r.right - r.left, r.bottom - r.top);
+        // a flyout is a small pill; the taskbar, menus and the desktop are far bigger
+        if !(80..=800).contains(&w) || !(30..=300).contains(&ht) {
+            return true.into();
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        if pid == GetCurrentProcessId() {
+            return true.into();
+        }
+        let mut cb = [0u16; 80];
+        let n = GetClassNameW(h, &mut cb).max(0) as usize;
+        let class = String::from_utf16_lossy(&cb[..n]);
+        let exe = exe_name(pid);
+        if ctx.diag {
+            crate::log!("osd: small topmost window: class={class} exe={exe} {w}x{ht} at {},{} ex={ex:#x}", r.left, r.top);
+            return true.into();
+        }
+        let shell = matches!(
+            exe.as_str(),
+            "explorer.exe" | "shellexperiencehost.exe" | "shellhost.exe" | "systemsettings.exe" | "textinputhost.exe"
+        );
+        let keep = class.starts_with("Shell_") || matches!(class.as_str(), "Progman" | "WorkerW" | "NotifyIconOverflowWindow");
+        if !shell || keep {
+            return true.into();
+        }
+        if !ctx.seen.contains(&(h.0 as isize)) {
+            ctx.seen.push(h.0 as isize);
+            crate::log!("osd: hiding system flyout class={class} exe={exe} {w}x{ht}");
+        }
+        let _ = ShowWindow(h, SW_HIDE);
+        if IsWindowVisible(h).as_bool() {
+            let _ = SetWindowPos(h, None, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        ctx.hidden += 1;
+        true.into()
+    }
+
+    /// Called right after a brightness change: watch for the system flyout for a moment and hide it.
+    pub fn suppress() {
+        if !ON.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut ctx = Ctx { seen: Vec::new(), hidden: 0, diag: false };
+        for _ in 0..48 {
+            std::thread::sleep(Duration::from_millis(25));
+            unsafe {
+                let _ = EnumWindows(Some(each), LPARAM(&mut ctx as *mut Ctx as isize));
+            }
+        }
+        // nothing found the first time: write down what small topmost windows exist, to find the right one
+        if ctx.hidden == 0 && !DIAG_DONE.swap(true, Ordering::Relaxed) {
+            ctx.diag = true;
+            std::thread::sleep(Duration::from_millis(60));
+            crate::log!("osd: no system flyout matched; listing small topmost windows");
+            unsafe {
+                let _ = EnumWindows(Some(each), LPARAM(&mut ctx as *mut Ctx as isize));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

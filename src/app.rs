@@ -724,6 +724,8 @@ pub struct App {
     trim_at: Option<Instant>,
     dock: Option<crate::dock::Dock>,
     launcher: Option<crate::launcher::Launcher>,
+    /// Settings, in a window of its own (while that window is open).
+    settings_win: Option<crate::settings_win::SettingsWin>,
     radial: Option<crate::radial::Radial>,
     /// The radial menu's option hid the Windows taskbar.
     radial_hid: bool,
@@ -866,6 +868,7 @@ impl App {
             trim_at: None,
             dock: None,
             launcher: None,
+            settings_win: None,
             radial: None,
             radial_hid: false,
             settled: true,
@@ -930,6 +933,10 @@ impl App {
                 RAWINPUTDEVICE { usUsagePage: 0x01, usUsage: 0x06, dwFlags: RIDEV_INPUTSINK, hwndTarget: self.hwnd };
             if let Err(e) = RegisterRawInputDevices(&[rid], std::mem::size_of::<RAWINPUTDEVICE>() as u32) {
                 log!("raw input unavailable: {e}");
+            }
+            // the touchpad's reports, for the three-finger swipe of the switcher
+            if self.cfg.hotkeys.switch_swipe && !crate::touchpad::register(self.hwnd.0 as isize) {
+                log!("touchpad swipe unavailable");
             }
         }
         dragdrop::register_target(self.hwnd, |ev| crate::window::with_app(|a| a.on_drop_event(ev)).unwrap_or(false));
@@ -1164,6 +1171,16 @@ impl App {
     }
 
     fn on_raw_input(&mut self, lp: LPARAM) {
+        if self.cfg.hotkeys.switch_swipe {
+            // a touchpad report: three fingers sideways steps the switcher, lifting them chooses
+            let o = crate::touchpad::feed(lp.0);
+            if o.hid {
+                if o.steps != 0 || o.end {
+                    self.on_swipe(o.steps, o.end);
+                }
+                return;
+            }
+        }
         let mut ri = RAWINPUT::default();
         let mut size = std::mem::size_of::<RAWINPUT>() as u32;
         let n = unsafe {
@@ -1203,7 +1220,15 @@ impl App {
             return false;
         }
         match ev {
-            DropEvent::Enter => {
+            DropEvent::Over(sx, sy) => {
+                let mut pt = POINT { x: sx, y: sy };
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut pt);
+                }
+                crate::modules::shelf::drag_pointer(pt.x as f32 / self.scale, pt.y as f32 / self.scale);
+            }
+            DropEvent::Enter(files) => {
+                crate::modules::shelf::drag_enter(files);
                 self.drag_hover = true;
                 self.user_hidden = false;
                 if self.mode != Mode::Expanded || self.page != "shelf" {
@@ -1281,6 +1306,9 @@ impl App {
                             }
                             fx.redraw = true;
                             self.apply_effects(fx);
+                            if id == "settings" {
+                                self.settings_refresh();
+                            }
                         }
                     }
                 }
@@ -1338,7 +1366,11 @@ impl App {
             self.reload_config();
         }
         if let Some(page) = fx.open_page {
-            self.expand(Some(page));
+            if page == "settings" {
+                self.open_settings();
+            } else {
+                self.expand(Some(page));
+            }
         }
         if fx.expand && self.mode != Mode::Expanded {
             self.expand(None);
@@ -2216,6 +2248,7 @@ impl App {
             tray::CMD_TOGGLE => self.toggle(),
             tray::CMD_AI => self.on_hotkey(Action::Ai),
             tray::CMD_TIMER => self.expand(Some("timer")),
+            tray::CMD_SETTINGS => self.open_settings(),
             tray::CMD_HIDE => {
                 self.user_hidden = !self.user_hidden;
                 if self.user_hidden {
@@ -2280,6 +2313,7 @@ impl App {
                 self.place();
                 self.broadcast(SystemEvent::ConfigReloaded);
                 log!("config reloaded");
+                self.settings_refresh();
             }
             LoadResult::Invalid(e) => {
                 log!("config error: {e}");
@@ -2619,6 +2653,12 @@ impl App {
                     t.r += 1.0;
                 }
             }
+        }
+        if crate::ui::look_alcove() && t.h >= 20.0 {
+            // one family of corners for every size and state: the radius and the ears follow the height
+            // (measured from the reference notch), so the closed notch, peeks and open pages all match
+            t.r = if t.exp { 56.0 } else { (t.h * 0.30).clamp(6.0, 56.0) };
+            t.ear = if t.exp { 14.0 } else { (t.h * 0.085).clamp(3.0, 14.0) };
         }
         t
     }
@@ -4207,7 +4247,7 @@ impl App {
         self.host.set_backdrop(bp, a_r * s, blur * self.anim.shown.value * bd_k);
 
         if let Some(page) = fx.open_page.take() {
-            if self.mode == Mode::Expanded && self.page_available(page) {
+            if page != "settings" && self.mode == Mode::Expanded && self.page_available(page) {
                 if self.page != page {
                     self.switch_page(page);
                     self.set_keyboard(page == "ai");
@@ -4221,6 +4261,66 @@ impl App {
             self.clock_min = st.wSecond;
         }
         fx
+    }
+
+    /// Open Settings in its window (or bring it to the front when it is already open).
+    fn open_settings(&mut self) {
+        if self.module_index("settings").is_none() {
+            return;
+        }
+        if let Some(w) = self.settings_win.as_mut() {
+            w.raise();
+            self.settings_refresh();
+            return;
+        }
+        match crate::settings_win::SettingsWin::new(&self.gfx, self.host.compositor.clone()) {
+            Ok(w) => {
+                self.settings_win = Some(w);
+                self.settings_refresh();
+            }
+            Err(e) => log!("settings window failed to start: {e}"),
+        }
+    }
+
+    /// Messages for the Settings window.
+    pub fn settings_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let w = self.settings_win.as_mut()?;
+        let r = w.handle(msg, wp, lp);
+        if w.closed() {
+            self.settings_win = None;
+            return r;
+        }
+        if w.dirty() {
+            self.settings_refresh();
+        }
+        r
+    }
+
+    /// Draw the Settings window once more (after the keys that came in) and carry out what the page asked for.
+    fn settings_refresh(&mut self) {
+        let Some(mut win) = self.settings_win.take() else { return };
+        let Some(i) = self.module_index("settings") else {
+            self.settings_win = Some(win);
+            return;
+        };
+        let mut fx = Effects::default();
+        for k in win.take_keys() {
+            if self.modules[i].wants_keyboard() {
+                let mut cx = Cx {
+                    bus: &self.bus,
+                    cfg: &self.cfg,
+                    fx: &mut fx,
+                    hwnd: SendHwnd::new(self.hwnd),
+                    now: Instant::now(),
+                };
+                self.modules[i].on_key(k, &mut cx);
+            }
+        }
+        win.draw(&self.gfx, self.modules[i].as_mut(), &self.cfg, &self.bus, &mut fx, self.accent);
+        // the keys go to this window, not to the notch
+        fx.keyboard_focus = None;
+        self.settings_win = Some(win);
+        self.apply_effects(fx);
     }
 
     /// Messages for the launcher's own window. When it has been idle for a long time it is dropped
@@ -4316,6 +4416,17 @@ impl App {
         let Some(scale) = self.launcher_ready() else { return };
         if let Some(l) = self.launcher.as_mut() {
             l.windows_step(&self.gfx, scale, back);
+        }
+    }
+
+    /// A three-finger swipe on the touchpad: the switcher opens and steps (right: on, left: back); lifting the
+    /// fingers opens the window it stopped on (in the Alcove look; the classic launcher only steps).
+    fn on_swipe(&mut self, steps: i32, end: bool) {
+        for _ in 0..steps.unsigned_abs() {
+            self.launcher_switch(steps < 0);
+        }
+        if end {
+            self.alcove_launch("switch-end");
         }
     }
 
@@ -6467,7 +6578,7 @@ fn key_input(vk: VIRTUAL_KEY, up: bool) -> INPUT {
     }
 }
 
-fn translate_key(vk: u32) -> Option<Key> {
+pub(crate) fn translate_key(vk: u32) -> Option<Key> {
     let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
     let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
     let vk = VIRTUAL_KEY(vk as u16);
@@ -6487,6 +6598,7 @@ fn translate_key(vk: u32) -> Option<Key> {
         _ if ctrl && vk == VIRTUAL_KEY(b'C' as u16) => Key::Copy,
         _ if ctrl && vk == VIRTUAL_KEY(b'V' as u16) => Key::Paste,
         _ if ctrl && vk == VIRTUAL_KEY(b'X' as u16) => Key::Cut,
+        _ if ctrl && vk == VIRTUAL_KEY(b'K' as u16) => Key::Menu,
         _ => return None,
     })
 }

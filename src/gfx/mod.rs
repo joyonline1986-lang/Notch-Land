@@ -1136,7 +1136,7 @@ impl<'a> Painter<'a> {
         let e = ear.min(h * 0.5).max(0.0);
         let alcove = crate::ui::look_alcove() && r0 * 2.0 < body.w - 0.5;
         let (ex, ey, tp, cn, en) =
-            if alcove { (e, (e * EAR_TALL).min(h * 0.5), wall_taper(h), CORNER_N, EAR_N) } else { (e, e, 0.0, 2.0, 2.0) };
+            if alcove { (e, (e * ear_tall(h)).min(h * 0.5), wall_taper(h), CORNER_N, EAR_N) } else { (e, e, 0.0, 2.0, 2.0) };
         let r = if alcove { r0.min(h - ey).max(0.0) } else { r0 };
         // the notch itself (the same 20 steps as `notch_path`), walked backwards so it cuts a hole out of each ring
         let hole: Vec<(f32, f32)> = notch_outline(x0, x1, h, r, ex, ey, tp, cn, en, 20).into_iter().rev().collect();
@@ -2058,7 +2058,16 @@ fn notch_outline(x0: f32, x1: f32, h: f32, r: f32, ex: f32, ey: f32, tp: f32, cn
             v.push((x0 + tp + r - r * c, h - r + r * s));
         }
     }
-    v.push((x1 - tp - r, h));
+    let (xa, xb) = (x0 + tp + r, x1 - tp - r);
+    // a very slight arc along the bottom edge: it sags a little, lowest in the middle
+    let sag = if cn > 2.05 && h > 20.0 { ((xb - xa) * 0.0075).clamp(0.8, 3.5) } else { 0.0 };
+    if sag > 0.0 && xb - xa > 24.0 {
+        for j in 1..16 {
+            let u = j as f32 / 16.0;
+            v.push((xa + (xb - xa) * u, h + sag * 4.0 * u * (1.0 - u)));
+        }
+    }
+    v.push((xb, h));
     if r > 0.0 {
         for i in 1..=steps {
             let (c, s) = se(cn, i);
@@ -2230,10 +2239,13 @@ impl PathBuilder {
 pub const CORNER_N: f32 = 3.1;
 /// The same for the concave ears at the top (a little softer than a circle).
 const EAR_N: f32 = 2.3;
-/// An ear is taller than it is wide, like the reference's (about 1.35 times).
-const EAR_TALL: f32 = 1.35;
+/// An ear is taller than it is wide: about 2.2 times on the small closed notch, easing to about 1.36 times
+/// on a tall open one (measured from the reference).
+fn ear_tall(h: f32) -> f32 {
+    2.2 - 0.84 * ((h - 40.0) / 80.0).clamp(0.0, 1.0)
+}
 /// How far (in px, per side) the side walls of a tall Alcove notch lean inward by the bottom.
-pub const WALL_TAPER: f32 = 3.5;
+pub const WALL_TAPER: f32 = 2.0;
 pub fn wall_taper(h: f32) -> f32 {
     if crate::ui::look_alcove() {
         ((h - 70.0) / 90.0).clamp(0.0, 1.0) * WALL_TAPER
@@ -2254,7 +2266,7 @@ pub fn notch_path(p: &Painter, body: Rect, bottom_radius: f32, ear: f32) -> Opti
     // (a full half-circle, the round bubbles, stays a circle)
     if crate::ui::look_alcove() && r * 2.0 < body.w - 0.5 {
         let ex = e;
-        let ey = (e * EAR_TALL).min(h * 0.5);
+        let ey = (e * ear_tall(h)).min(h * 0.5);
         let r = r.min(h - ey).max(0.0);
         let tp = wall_taper(h);
         const STEPS: usize = 20;

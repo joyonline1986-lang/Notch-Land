@@ -1,5 +1,9 @@
 # Changelog
 
+- Window switcher (Alt+Tab, Alcove look): now a row of app icons with a lit square that glides to the choice and its name underneath. Tab, the arrows, the wheel or a sideways swipe move it. New: swipe three fingers sideways on a precision touchpad to open it and move through it, lift to open the window (setting: [hotkeys] switch_swipe; Windows' own three-finger gestures must be off).
+
+- File shelf: dragging files over the notch now shows four tiles: Tray (park it), Downloads and Desktop (put a copy there) and Converter (opens into the formats).
+
 - Music glow: while a track plays, a soft aura in the colour of the cover surrounds the notch (and the two media bubbles). It fades in over about a second and a half, drifts to the next cover's colour, breathes very slowly and sits back while the notch is open. Setting: General, soft glow while music plays.
 
 - Settings: tabs taller than the window now scroll with the wheel, a row at a time, instead of flipping the page (this also brings the last rows, such as the round-dial switch, into reach).

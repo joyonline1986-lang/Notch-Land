@@ -4478,6 +4478,51 @@ pub(crate) fn bridge_paste() {
     paste_soon();
 }
 
+/// Run the program at `path` as the administrator.
+pub(crate) fn bridge_admin(path: &str) {
+    run_as_admin(path);
+}
+
+/// Quit the program at `path` and start it again.
+pub(crate) fn bridge_restart(path: &str) {
+    if let Some(exe) = exe_name(path) {
+        restart_app(exe, path.to_string());
+    }
+}
+
+/// Take the app off the computer.
+pub(crate) fn bridge_uninstall(path: &str, name: &str) {
+    uninstall_app(path, name);
+}
+
+/// Open `src` with the app `dst` (act 0), or move (1) or copy (2) it into the folder `dst`.
+pub(crate) fn bridge_target(act: u8, src: String, dst: String) {
+    std::thread::spawn(move || {
+        if act == 0 {
+            let exe = if dst.to_ascii_lowercase().ends_with(".exe") { Some(dst.clone()) } else { crate::dock::lnk_target(&dst) };
+            match exe {
+                Some(exe) => {
+                    let _ = std::process::Command::new(exe).arg(&src).spawn();
+                }
+                None => sys::shell_open(&src),
+            }
+            return;
+        }
+        let from = Path::new(&src);
+        let Some(name) = from.file_name() else { return };
+        let to = Path::new(&dst).join(name);
+        if to.exists() {
+            return;
+        }
+        if act == 1 && std::fs::rename(from, &to).is_ok() {
+            return;
+        }
+        if copy_all(from, &to).is_ok() && act == 1 {
+            let _ = if from.is_dir() { std::fs::remove_dir_all(from) } else { std::fs::remove_file(from) };
+        }
+    });
+}
+
 /// Ask the program at `path` to quit (or end it at once when `force`), in the background.
 pub(crate) fn bridge_quit(path: &str, force: bool) {
     if let Some(exe) = exe_name(path) {

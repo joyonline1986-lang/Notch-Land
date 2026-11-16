@@ -407,7 +407,7 @@ impl Downloads {
 // Worker
 // ---------------------------------------------------------------------------
 
-fn downloads_folder() -> Option<PathBuf> {
+pub(crate) fn downloads_folder() -> Option<PathBuf> {
     unsafe {
         let p = SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, None).ok()?;
         let s = p.to_string().ok();

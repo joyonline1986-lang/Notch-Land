@@ -334,6 +334,8 @@ pub enum Key {
     Copy,
     Paste,
     Cut,
+    /// Ctrl+K: the actions menu of the launcher.
+    Menu,
 }
 
 #[allow(unused_variables)]
